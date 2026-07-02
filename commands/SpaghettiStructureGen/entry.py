@@ -1,14 +1,17 @@
 """
 entry.py — SpaghettiStructureGen command: dialog, event handlers.
 
-Handler flow:
-  command_created   → builds all dialog inputs, registers sub-handlers
-  command_input_changed → recomputes truss + BOM, redraws sketch preview
-  command_preview   → marks result valid (geometry built in inputChanged)
-  command_execute   → builds full solid geometry, optionally exports CSV
-  command_destroy   → clears local_handlers
+Correct handler flow:
+  command_created      → builds all dialog inputs, registers sub-handlers
+  command_input_changed→ dialog-only updates: show/hide groups, BOM text, slider bounds
+                         NO Fusion geometry — InputChanged is not for design modifications
+  command_preview      → recomputes truss math + draws sketch wire-frame preview
+                         (called by Fusion whenever inputs change after InputChanged)
+  command_execute      → builds full solid geometry, optionally exports CSV
+  command_destroy      → clears local_handlers
 
-All event handlers are wrapped in try/except per Fusion add-in best practice.
+All event handlers have their own try/except that calls ui.messageBox so errors
+are always visible during development.
 """
 
 from __future__ import annotations
@@ -277,7 +280,7 @@ def _update_visibility(inputs: adsk.core.CommandInputs, mode: str) -> None:
 
 def _get_str(inputs: adsk.core.CommandInputs, id_: str) -> str:
     item = inputs.itemById(id_)
-    if item and hasattr(item, 'selectedItem'):
+    if item and hasattr(item, 'selectedItem') and item.selectedItem:
         return item.selectedItem.name
     return ''
 
@@ -302,6 +305,19 @@ def _get_slider(inputs: adsk.core.CommandInputs, id_: str) -> int:
     return 0
 
 
+def _get_weight_limit_g(inputs: adsk.core.CommandInputs) -> float:
+    """
+    Read the weight limit (grams) from the ValueCommandInput whose units are ''.
+    Fusion stores unitless ValueInputs at face value so .value == the entered number.
+    """
+    return _get_val_cm(inputs, 'weight_limit')
+
+
+def _get_load_n(inputs: adsk.core.CommandInputs) -> float:
+    """Read applied load in Newtons (stored as a unitless value)."""
+    return _get_val_cm(inputs, 'load_magnitude')
+
+
 def _recompute(inputs: adsk.core.CommandInputs) -> tuple:
     """
     Recompute nodes, members, forces and BOM from current dialog values.
@@ -314,7 +330,7 @@ def _recompute(inputs: adsk.core.CommandInputs) -> tuple:
     bundle_dia = _get_val_mm(inputs, 'bundle_dia')
     strand_dia = _get_val_mm(inputs, 'strand_dia')
     strand_len = _get_val_mm(inputs, 'strand_len')
-    load_mag   = _get_val_cm(inputs, 'load_magnitude')  # N (dimensionless in Fusion)
+    load_mag      = _get_load_n(inputs)   # Newtons — unitless ValueInput
     load_node_idx = _get_slider(inputs, 'load_node')
 
     if mode == 'Bridge':
@@ -340,7 +356,6 @@ def _recompute(inputs: adsk.core.CommandInputs) -> tuple:
         load_node_idx = min(load_node_idx, len(nodes) - 1)
 
         # Supports: pin at node 0, roller at node n_panels (bottom chord)
-        n_bot = n_panels + 1
         supports = [(0, 'pin'), (n_panels, 'roller')]
         loads    = [(load_node_idx, 0.0, -abs(load_mag))]
         forces   = solve_2d(nodes, members, supports, loads)
@@ -402,39 +417,34 @@ def _format_bom_html(summ: dict, weight_limit_g: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# InputChanged
+# InputChanged — dialog-only updates, NO Fusion geometry
 # ---------------------------------------------------------------------------
 
 def command_input_changed(args: adsk.core.InputChangedEventArgs) -> None:
+    """Update dialog state only. Geometry preview is handled in ExecutePreview."""
     app = adsk.core.Application.get()
-    ui  = app.userInterface
     try:
-        inputs       = args.inputs
-        changed_id   = args.input.id
+        inputs     = args.inputs
+        changed_id = args.input.id
         futil.log(f'{CMD_NAME} InputChanged: {changed_id}')
 
-        # Update mode visibility
+        # 1. Update group visibility based on selected mode
         mode = _get_str(inputs, 'mode')
         _update_visibility(inputs, mode)
 
-        # Recompute truss
-        nodes, members, forces, bom, summ, mode = _recompute(inputs)
+        # 2. Recompute truss math (pure Python — no Fusion API calls)
+        nodes, members, forces, bom, summ, cur_mode = _recompute(inputs)
 
-        # Update load_node slider max
+        # 3. Update load_node slider max to match actual node count
         load_node_si = inputs.itemById('load_node')
         if load_node_si and len(nodes) > 1:
             load_node_si.maximumValue = len(nodes) - 1
 
-        # Update BOM text box
-        weight_limit = _get_val_cm(inputs, 'weight_limit')   # unitless N → treat as grams
+        # 4. Update BOM summary text box
+        weight_limit = _get_weight_limit_g(inputs)
         bom_tb = inputs.itemById('bom_summary')
         if bom_tb:
             bom_tb.formattedText = _format_bom_html(summ, weight_limit)
-
-        # Draw sketch preview (fast wire-frame)
-        design = app.activeProduct
-        if isinstance(design, adsk.fusion.Design):
-            build_sketch_preview(design, nodes, members, mode)
 
     except Exception:
         app.userInterface.messageBox(
@@ -443,15 +453,35 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ExecutePreview
+# ExecutePreview — geometry sketch wire-frame drawn here
 # ---------------------------------------------------------------------------
 
 def command_preview(args: adsk.core.CommandEventArgs) -> None:
+    """
+    Build the lightweight sketch wire-frame preview.
+    Fusion calls this after every InputChanged cycle completes.
+    """
     app = adsk.core.Application.get()
     try:
         futil.log(f'{CMD_NAME} ExecutePreview')
-        # Sketch preview already drawn in inputChanged; mark valid.
-        args.isValidResult = True
+
+        design = app.activeProduct
+        if not isinstance(design, adsk.fusion.Design):
+            return   # No design open — skip silently
+
+        inputs = args.command.commandInputs
+
+        # Use cached truss data (already computed in InputChanged) or recompute
+        nodes   = _current_nodes
+        members = _current_members
+        mode    = _get_str(inputs, 'mode')
+
+        # If cache is empty (first open) run compute now
+        if not nodes:
+            nodes, members, _, _, _, mode = _recompute(inputs)
+
+        build_sketch_preview(design, nodes, members, mode)
+
     except Exception:
         app.userInterface.messageBox(
             f'{CMD_NAME} Preview error:\n{traceback.format_exc()}'
