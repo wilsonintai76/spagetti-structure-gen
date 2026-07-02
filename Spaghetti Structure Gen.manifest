@@ -1,0 +1,13 @@
+{
+	"autodeskProduct":	"Fusion",
+	"type":	"addin",
+	"author":	"Wilson Bin Intai",
+	"description":	{
+		"":	"\"SpaghettiStructureGen\" that parametrically generates truss geometry for a spaghetti bridge/tower engineering competition."
+	},
+	"version":	"1.0.0",
+	"runOnStartup":	false,
+	"supportedOS":	"windows|mac",
+	"editEnabled":	true,
+	"iconFilename":	"AddInIcon.svg"
+}

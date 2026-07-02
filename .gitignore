@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Fusion 360 temp/cache
+*.fusionbackup
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+*.suo
+*.user
+
+# Test artifacts
+*.csv
